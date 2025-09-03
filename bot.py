@@ -16,14 +16,14 @@ DST_RAW = os.getenv("TARGET_CHANNEL", "").strip()
 if not BOT_TOKEN or not SRC_RAW or not DST_RAW:
     raise SystemExit("❌ Set BOT_TOKEN, SOURCE_CHANNEL, TARGET_CHANNEL in Variables.")
 
-# ========= Keepalive HTTP (start ONCE) =========
+# ========= Keepalive HTTP (start ONLY ONCE) =========
 async def _ok(_):
     return web.Response(text="ok")
 
 async def start_keepalive_once():
     app = web.Application()
     app.router.add_get("/", _ok)
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "8080"))  # Railway provides PORT
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
@@ -68,7 +68,7 @@ async def flush_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str, t
     if media:
         await context.bot.send_media_group(chat_id=target_id, media=media)
 
-# ========= Globals resolved later =========
+# ========= Globals resolved after startup =========
 SOURCE_ID: int | None = None
 TARGET_ID: int | None = None
 
@@ -99,32 +99,28 @@ async def on_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         print(f"❌ Handler error: {e!r}")
 
-async def run_once():
-    # Start keepalive HTTP **once**
-    await start_keepalive_once()
-
-    # Build app & resolve channel IDs
+async def build_app_and_resolve():
     app = Application.builder().token(BOT_TOKEN).build()
-
     global SOURCE_ID, TARGET_ID
     SOURCE_ID = await resolve_chat_id(app.bot, SRC_RAW)
     TARGET_ID = await resolve_chat_id(app.bot, DST_RAW)
     print(f"✅ Resolved SOURCE_ID={SOURCE_ID}, TARGET_ID={TARGET_ID}")
-
-    # Listen to channel posts (no edits to keep simple/stable)
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_message))
-
-    print("✅ Bot is running (polling).")
-    await app.run_polling(
-        close_loop=True,
-        allowed_updates=["channel_post"],
-        drop_pending_updates=True
-    )
+    return app
 
 async def main():
+    # Start keepalive ONCE (before retry loop)
+    await start_keepalive_once()
+
     while True:
         try:
-            await run_once()
+            app = await build_app_and_resolve()
+            print("✅ Bot is running (polling).")
+            await app.run_polling(
+                close_loop=True,
+                allowed_updates=["channel_post"],
+                drop_pending_updates=True
+            )
         except TelegramError as e:
             print(f"⚠️ TelegramError: {e}. Retry in 3s.")
         except Exception as e:

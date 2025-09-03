@@ -9,8 +9,7 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest, Forbidden
 from telegram.ext import (
     Application, AIORateLimiter,
-    ChannelPostHandler, EditedChannelPostHandler,
-    ContextTypes
+    MessageHandler, ContextTypes, filters
 )
 
 # ========= ENV =========
@@ -45,20 +44,12 @@ def _normalize_handle(x: str) -> str:
     return x
 
 async def resolve_chat_id(bot, raw: str) -> int:
-    """
-    Accepts:
-      - @handle
-      - https://t.me/handle
-      - -100xxxxxxxxxxxx (already numeric)
-    Returns numeric chat_id (int). Raises if not resolvable / bot missing access.
-    """
+    """Accept @handle / t.me link / -100… and return numeric chat_id."""
     raw = raw.strip()
-    # already numeric id?
     if raw.startswith("-100") or raw.lstrip("-").isdigit():
         return int(raw)
-
     handle = _normalize_handle(raw)
-    chat = await bot.get_chat(handle)  # requires bot to have access (admin/member)
+    chat = await bot.get_chat(handle)  # bot must be admin/member
     return int(chat.id)
 
 # ========= Album buffer =========
@@ -81,16 +72,17 @@ async def flush_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str, t
     if media:
         await context.bot.send_media_group(chat_id=target_id, media=media)
 
-# ========= Handlers (filled later after IDs resolved) =========
+# ========= Globals (filled after resolving) =========
 SOURCE_ID: int | None = None
 TARGET_ID: int | None = None
 
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle NEW channel posts only (edits ignored for stability)."""
     try:
-        msg = update.channel_post
-        if not msg:
+        msg = update.effective_message  # works for channel_post with MessageHandler
+        if not msg or not update.effective_chat:
             return
-        if msg.chat.id != SOURCE_ID:
+        if update.effective_chat.id != SOURCE_ID:
             return
 
         if msg.media_group_id:
@@ -104,58 +96,41 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.copy_message(
             chat_id=TARGET_ID,
-            from_chat_id=msg.chat.id,
+            from_chat_id=SOURCE_ID,
             message_id=msg.message_id,
         )
     except (BadRequest, Forbidden) as e:
-        # Most common: chat not found / bot not admin
-        print(f"❌ Handler BadRequest/Forbidden: {e}")
+        print(f"❌ BadRequest/Forbidden: {e}")
     except Exception as e:
         print(f"❌ Handler error: {e!r}")
 
-async def on_edited_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = update.edited_channel_post
-        if not msg or msg.chat.id != SOURCE_ID:
-            return
-        with suppress(Exception):
-            await context.bot.copy_message(
-                chat_id=TARGET_ID,
-                from_chat_id=msg.chat.id,
-                message_id=msg.message_id,
-            )
-    except Exception as e:
-        print(f"❌ Edited handler error: {e!r}")
-
 # ========= Runner =========
-async def run_bot():
+async def run_bot_once():
     await start_keepalive()
 
-    # Build app first to get bot instance for resolving IDs
     app = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
 
-    # Resolve IDs
+    # Resolve numeric IDs from the env values
     global SOURCE_ID, TARGET_ID
     SOURCE_ID = await resolve_chat_id(app.bot, SRC_RAW)
     TARGET_ID = await resolve_chat_id(app.bot, DST_RAW)
     print(f"✅ Resolved SOURCE_ID={SOURCE_ID}, TARGET_ID={TARGET_ID}")
 
-    # Register handlers
-    app.add_handler(ChannelPostHandler(on_channel_post))
-    app.add_handler(EditedChannelPostHandler(on_edited_channel_post))
+    # Listen to channel posts using MessageHandler
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_message))
 
     print("✅ Bot is running (polling).")
     await app.run_polling(
         close_loop=True,
-        allowed_updates=["channel_post", "edited_channel_post"],
+        allowed_updates=["channel_post"],  # keep it minimal
         drop_pending_updates=True
     )
 
 async def main():
-    # resilient loop
+    # Resilient loop: restart polling if it ever crashes
     while True:
         try:
-            await run_bot()
+            await run_bot_once()
         except TelegramError as e:
             print(f"⚠️ TelegramError: {e}. Retry in 3s.")
         except Exception as e:

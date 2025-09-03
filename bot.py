@@ -7,24 +7,20 @@ from aiohttp import web
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest, Forbidden
-from telegram.ext import (
-    Application, AIORateLimiter,
-    MessageHandler, ContextTypes, filters
-)
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 # ========= ENV =========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SRC_RAW = os.getenv("SOURCE_CHANNEL", "").strip()
 DST_RAW = os.getenv("TARGET_CHANNEL", "").strip()
-
 if not BOT_TOKEN or not SRC_RAW or not DST_RAW:
-    raise SystemExit("❌ Please set BOT_TOKEN, SOURCE_CHANNEL, TARGET_CHANNEL in Railway Variables.")
+    raise SystemExit("❌ Set BOT_TOKEN, SOURCE_CHANNEL, TARGET_CHANNEL in Variables.")
 
-# ========= Keepalive HTTP (so Railway keeps it alive) =========
+# ========= Keepalive HTTP (start ONCE) =========
 async def _ok(_):
     return web.Response(text="ok")
 
-async def start_keepalive():
+async def start_keepalive_once():
     app = web.Application()
     app.router.add_get("/", _ok)
     port = int(os.getenv("PORT", "8080"))
@@ -49,7 +45,7 @@ async def resolve_chat_id(bot, raw: str) -> int:
     if raw.startswith("-100") or raw.lstrip("-").isdigit():
         return int(raw)
     handle = _normalize_handle(raw)
-    chat = await bot.get_chat(handle)  # bot must be admin/member
+    chat = await bot.get_chat(handle)  # bot must have access/admin
     return int(chat.id)
 
 # ========= Album buffer =========
@@ -72,17 +68,16 @@ async def flush_album(context: ContextTypes.DEFAULT_TYPE, media_group_id: str, t
     if media:
         await context.bot.send_media_group(chat_id=target_id, media=media)
 
-# ========= Globals (filled after resolving) =========
+# ========= Globals resolved later =========
 SOURCE_ID: int | None = None
 TARGET_ID: int | None = None
 
 async def on_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle NEW channel posts only (edits ignored for stability)."""
+    """Mirror NEW posts from source channel."""
     try:
-        msg = update.effective_message  # works for channel_post with MessageHandler
-        if not msg or not update.effective_chat:
-            return
-        if update.effective_chat.id != SOURCE_ID:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if not msg or not chat or chat.id != SOURCE_ID:
             return
 
         if msg.media_group_id:
@@ -104,33 +99,32 @@ async def on_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         print(f"❌ Handler error: {e!r}")
 
-# ========= Runner =========
-async def run_bot_once():
-    await start_keepalive()
+async def run_once():
+    # Start keepalive HTTP **once**
+    await start_keepalive_once()
 
-    app = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
+    # Build app & resolve channel IDs
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Resolve numeric IDs from the env values
     global SOURCE_ID, TARGET_ID
     SOURCE_ID = await resolve_chat_id(app.bot, SRC_RAW)
     TARGET_ID = await resolve_chat_id(app.bot, DST_RAW)
     print(f"✅ Resolved SOURCE_ID={SOURCE_ID}, TARGET_ID={TARGET_ID}")
 
-    # Listen to channel posts using MessageHandler
+    # Listen to channel posts (no edits to keep simple/stable)
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_message))
 
     print("✅ Bot is running (polling).")
     await app.run_polling(
         close_loop=True,
-        allowed_updates=["channel_post"],  # keep it minimal
+        allowed_updates=["channel_post"],
         drop_pending_updates=True
     )
 
 async def main():
-    # Resilient loop: restart polling if it ever crashes
     while True:
         try:
-            await run_bot_once()
+            await run_once()
         except TelegramError as e:
             print(f"⚠️ TelegramError: {e}. Retry in 3s.")
         except Exception as e:
